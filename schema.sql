@@ -22,9 +22,11 @@ CREATE TABLE IF NOT EXISTS results (
   era TEXT NOT NULL,
   topic TEXT NOT NULL,
   hints TEXT NOT NULL DEFAULT '[]',
+  daily_id TEXT,
   played_at TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_results_user ON results(user_id);
 CREATE INDEX IF NOT EXISTS idx_results_user_created ON results(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_results_user_daily ON results(user_id, daily_id);

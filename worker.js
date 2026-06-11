@@ -1,9 +1,11 @@
 // Votle Worker
 // Endpoints:
-//   POST /register   { username, password } -> { token }
-//   POST /login       { username, password } -> { token }
-//   POST /result      (auth) game result payload -> { ok: true }
-//   GET  /stats        (auth) -> aggregated stats
+//   POST /register     { username, password } -> { token }
+//   POST /login         { username, password } -> { token }
+//   POST /result        (auth) game result payload -> { ok: true }
+//   GET  /stats          (auth) -> aggregated stats + achievements data
+//   GET  /history?limit=&offset=  (auth) -> paginated game history
+//   GET  /daily-status?id=YYYY-MM-DD (auth) -> whether today's daily was played
 //
 // Bindings expected:
 //   DB    - D1 database (see schema.sql)
@@ -163,7 +165,7 @@ async function handleResult(request, env) {
 
   const {
     resolutionId, won, accuracy, timeSeconds, guessesUsed, maxGuesses,
-    found, total, difficulty, era, topic, hints, date,
+    found, total, difficulty, era, topic, hints, date, dailyId,
   } = body;
 
   if (
@@ -184,15 +186,89 @@ async function handleResult(request, env) {
 
   await env.DB.prepare(`
     INSERT INTO results
-      (user_id, resolution_id, won, accuracy, time_seconds, guesses_used, max_guesses, found, total, difficulty, era, topic, hints, played_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (user_id, resolution_id, won, accuracy, time_seconds, guesses_used, max_guesses, found, total, difficulty, era, topic, hints, daily_id, played_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).bind(
     user.id, resolutionId, won ? 1 : 0, accuracy, timeSeconds, guessesUsed, maxGuesses,
     found, total, difficulty, era, topic, JSON.stringify(hints || []),
+    typeof dailyId === 'string' ? dailyId : null,
     typeof date === 'string' ? date : new Date().toISOString()
   ).run();
 
   return json({ ok: true });
+}
+
+// ---------- History ----------
+
+async function handleHistory(request, env) {
+  const user = await getUserFromRequest(request, env);
+  if (!user) return error('Not authenticated.', 401);
+
+  const url = new URL(request.url);
+  const limit = Math.min(50, Math.max(1, parseInt(url.searchParams.get('limit') || '20', 10) || 20));
+  const offset = Math.max(0, parseInt(url.searchParams.get('offset') || '0', 10) || 0);
+
+  const rows = await env.DB.prepare(`
+    SELECT resolution_id, won, accuracy, time_seconds, guesses_used, max_guesses,
+           found, total, difficulty, era, topic, hints, daily_id, played_at, created_at
+    FROM results WHERE user_id = ?
+    ORDER BY created_at DESC
+    LIMIT ? OFFSET ?
+  `).bind(user.id, limit, offset).all();
+
+  const totalRow = await env.DB.prepare(
+    'SELECT COUNT(*) as c FROM results WHERE user_id = ?'
+  ).bind(user.id).first();
+
+  const items = (rows.results || []).map(r => ({
+    resolutionId: r.resolution_id,
+    won: !!r.won,
+    accuracy: r.accuracy,
+    timeSeconds: r.time_seconds,
+    guessesUsed: r.guesses_used,
+    maxGuesses: r.max_guesses,
+    found: r.found,
+    total: r.total,
+    difficulty: r.difficulty,
+    era: r.era,
+    topic: r.topic,
+    hints: JSON.parse(r.hints || '[]'),
+    dailyId: r.daily_id,
+    playedAt: r.played_at,
+    createdAt: r.created_at,
+  }));
+
+  return json({ items, total: totalRow ? totalRow.c : 0, limit, offset });
+}
+
+// ---------- Daily challenge ----------
+
+async function handleDailyStatus(request, env) {
+  const user = await getUserFromRequest(request, env);
+  if (!user) return error('Not authenticated.', 401);
+
+  const url = new URL(request.url);
+  const dailyId = url.searchParams.get('id');
+  if (!dailyId) return error('Missing daily id.');
+
+  const row = await env.DB.prepare(`
+    SELECT won, accuracy, time_seconds, guesses_used, found, total, hints
+    FROM results WHERE user_id = ? AND daily_id = ?
+    ORDER BY created_at DESC LIMIT 1
+  `).bind(user.id, dailyId).first();
+
+  if (!row) return json({ played: false });
+
+  return json({
+    played: true,
+    won: !!row.won,
+    accuracy: row.accuracy,
+    timeSeconds: row.time_seconds,
+    guessesUsed: row.guesses_used,
+    found: row.found,
+    total: row.total,
+    hints: JSON.parse(row.hints || '[]'),
+  });
 }
 
 async function handleStats(request, env) {
@@ -200,7 +276,8 @@ async function handleStats(request, env) {
   if (!user) return error('Not authenticated.', 401);
 
   const rows = await env.DB.prepare(`
-    SELECT won, accuracy, time_seconds, guesses_used, found, difficulty, era, topic, created_at
+    SELECT won, accuracy, time_seconds, guesses_used, max_guesses, found, total,
+           difficulty, era, topic, hints, daily_id, played_at, created_at
     FROM results WHERE user_id = ? ORDER BY created_at ASC
   `).bind(user.id).all();
 
@@ -219,7 +296,7 @@ async function handleStats(request, env) {
   const winTimes = results.filter(r => r.won).map(r => r.time_seconds);
   const fastestTime = winTimes.length ? Math.min(...winTimes) : null;
 
-  // Streaks (chronological order)
+  // Win streaks (chronological order)
   let bestStreak = 0, currentStreak = 0, runningStreak = 0;
   for (const r of results) {
     if (r.won) {
@@ -230,6 +307,51 @@ async function handleStats(request, env) {
     }
   }
   currentStreak = runningStreak;
+
+  // Achievement-relevant aggregates
+  const noHintWins = results.filter(r => r.won && JSON.parse(r.hints || '[]').length === 0).length;
+  const flawlessWins = results.filter(r => r.won && r.guesses_used === 0).length;
+  const perfectAccuracyWins = results.filter(r => r.won && r.accuracy === 100).length;
+  const fastWins = results.filter(r => r.won && r.time_seconds <= 60).length;
+  const bigWins = results.filter(r => r.won && r.total >= 8).length;
+
+  // Daily challenge streak — consecutive calendar days (UTC) with a played
+  // daily challenge, counting back from today.
+  const dailyDates = [...new Set(
+    results.filter(r => r.daily_id).map(r => r.daily_id)
+  )].sort();
+  let dailyStreak = 0;
+  if (dailyDates.length) {
+    const today = new Date();
+    const todayStr = today.toISOString().slice(0, 10);
+    const dateSet = new Set(dailyDates);
+    let cursor = new Date(todayStr + 'T00:00:00Z');
+    // Allow streak to count if today hasn't been played yet but yesterday was
+    if (!dateSet.has(todayStr)) {
+      cursor.setUTCDate(cursor.getUTCDate() - 1);
+    }
+    while (true) {
+      const cursorStr = cursor.toISOString().slice(0, 10);
+      if (dateSet.has(cursorStr)) {
+        dailyStreak += 1;
+        cursor.setUTCDate(cursor.getUTCDate() - 1);
+      } else {
+        break;
+      }
+    }
+  }
+  const dailyPlayed = dailyDates.length;
+
+  // Time series for graphs — last 50 games, chronological
+  const recentResults = results.slice(-50);
+  const timeline = recentResults.map(r => ({
+    accuracy: r.accuracy,
+    found: r.found,
+    total: r.total,
+    won: !!r.won,
+    timeSeconds: r.time_seconds,
+    playedAt: r.played_at,
+  }));
 
   const byDifficulty = groupBreakdown(results, 'difficulty');
   const byEra = groupBreakdown(results, 'era');
@@ -244,6 +366,14 @@ async function handleStats(request, env) {
     currentStreak,
     totalFound,
     totalGuesses,
+    noHintWins,
+    flawlessWins,
+    perfectAccuracyWins,
+    fastWins,
+    bigWins,
+    dailyStreak,
+    dailyPlayed,
+    timeline,
     byDifficulty,
     byEra,
     byTopic,
@@ -292,6 +422,12 @@ export default {
       }
       if (pathname === '/stats' && request.method === 'GET') {
         return await handleStats(request, env);
+      }
+      if (pathname === '/history' && request.method === 'GET') {
+        return await handleHistory(request, env);
+      }
+      if (pathname === '/daily-status' && request.method === 'GET') {
+        return await handleDailyStatus(request, env);
       }
       return error('Not found.', 404);
     } catch (err) {
