@@ -1,0 +1,12 @@
+name = "votle"
+main = "worker.js"
+compatibility_date = "2026-06-11"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "votle"
+database_id = "50f3f2e4-5d88-478d-b0ce-897519823195"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "4b61ea637f2f4d519de37042e4fa7ca2"
